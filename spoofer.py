@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-discord science spoofer - inflate the playtime and games-played badges.
+Discord Badge Spoofer (modified)
 
-revere group, 2026. mit licensed (see LICENSE).
+I am against the use of this tool.
+I have never used it on any of my accounts and I never will.
 
-posts launch_game and running_game_heartbeat events to /api/v9/science, the same
-endpoint the real client uses to credit playtime. duration_tracked_ms isn't
-validated so any number goes straight through.
+This exists only as a technical demonstration and so the original
+project does not keep gaining free attention.
 
-run:
-    python spoofer.py
+Created / modified by @its_me_kyro
+https://x.com/its_me_kyro
 
-auth bits:
-    token            your account token, entered on first run           [saved]
-    cookie           cf_clearance, pasted by hand via menu option 3     [saved]
-    fingerprint      optional, only for the games-played count          [saved]
-    analytics_token  fetched from GET /users/@me?with_analytics_token=true, cached
-    super_props      from cordapi.dolfi.es (fallback: local)            [per run]
-    heartbeat/launch random uuids, fresh every run                      [per run]
+This tool violates Discord's Terms of Service.
+Running it is a good way to get your account suspended.
+Profile badges are meaningless.
 
-this breaks discord tos. your account, your problem.
+Requirements:
+  - Python 3.10+
+  - No third-party packages (stdlib only)
+
+Run:
+  python spoofer.py
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ import sys
 import tempfile
 import time
 import uuid
-import webbrowser
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict
@@ -47,24 +47,19 @@ for stream in (sys.stdout, sys.stderr):
 
 # paths
 ROOT = Path(__file__).resolve().parent
-GAMES_FILE = ROOT.parent / "data" / "games.json"     # full game list, downloaded if absent
-STATE_FILE = ROOT / "science_state.json"             # token, cookie, cached auth
+GAMES_FILE = ROOT / "data" / "games.json"
+STATE_FILE = ROOT / "science_state.json"
 
 ME_URL = "https://discord.com/api/v9/users/@me?with_analytics_token=true"
 SCIENCE_URL = "https://discord.com/api/v9/science"
-PROPERTIES_URL = "https://cordapi.dolfi.es/api/v2/properties/windows"  # current super_props, local fallback
-GAMES_CDN_URL = "https://cdn.discordapp.com/detectables/games.json"  # used if games.json isn't there
-SUBSCRIBE_URL = "https://www.youtube.com/@solasity?sub_confirmation=1"
-DISCORD_INVITE_LABEL = "discord.gg/QEC6QttWMh"
-DISCORD_INVITE_URL = "https://discord.gg/QEC6QttWMh"
-GATE_WAIT = 10            # seconds before enter is accepted on each setup step
+PROPERTIES_URL = "https://cordapi.dolfi.es/api/v2/properties/windows"
+GAMES_CDN_URL = "https://cdn.discordapp.com/detectables/games.json"
 
-BATCH_SIZE = 50           # events per /science request
-BATCH_DELAY = 1           # seconds between requests
-AUTH_MAX_AGE = 12 * 3600  # refetch the analytics token once the cache is older than this
+BATCH_SIZE = 50
+BATCH_DELAY = 1
+AUTH_MAX_AGE = 12 * 3600
 DEBUG = False
 
-# client identity
 CLIENT_VERSION = "1.0.9253"
 CLIENT_BUILD_NUMBER = 594031
 NATIVE_BUILD_NUMBER = 88414
@@ -77,7 +72,6 @@ USER_AGENT = (
 
 
 def _user_id_from_token(token: str) -> str:
-    # discord tokens start with base64(user_id) before the first dot
     try:
         first = token.split(".", 1)[0]
         pad = "=" * (-len(first) % 4)
@@ -86,11 +80,8 @@ def _user_id_from_token(token: str) -> str:
         return ""
 
 
-# powershell that reproduces discord's executable_fingerprint. it collects pe metadata
-# (file size, TimeDateStamp, SizeOfImage, header/section-table hashes, signing cert),
-# binds it to your machine guid + user id, and xor-obfuscates the result.
-# reverse-engineered by dolfies:
-# https://gist.github.com/dolfies/d442777ab8354e18c1a3827e27f85c3a
+# PowerShell that generates Discord's executable_fingerprint from PE metadata,
+# machine GUID and user id. Used only when the user chooses to set a fingerprint.
 _FINGERPRINT_PS1 = r'''
 param(
   [int]$ProcessId = 0,
@@ -141,35 +132,26 @@ public static class CertPubKeyHash {
 }
 "@
 
-if (!$Path) {
-  if (!$ProcessId) { throw "Pass -Path <exe> or -ProcessId <pid>." }
-  $Path = (Get-Process -Id $ProcessId).Path
+if (!$Path -and $ProcessId -gt 0) {
+  try { $Path = (Get-Process -Id $ProcessId -ErrorAction Stop).Path } catch { throw "Could not resolve process path." }
 }
 if (!$Path) { throw "Could not resolve executable path." }
 
-$fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
-try {
-  $fileSize = [UInt64]$fs.Length
-  $readSize = [int][Math]::Min($fs.Length, 0x10000)
-  $buf = [byte[]]::new($readSize)
-  $read = $fs.Read($buf, 0, $readSize)
-  if ($read -lt 0x40) { throw "File prefix is too small." }
-  if ($read -ne $readSize) { [Array]::Resize([ref]$buf, $read) }
-} finally {
-  $fs.Dispose()
-}
+$bytes = [IO.File]::ReadAllBytes($Path)
+$fileSize = $bytes.Length
+$buf = New-Object byte[] $fileSize
+[Array]::Copy($bytes, $buf, $fileSize)
 
 if ([BitConverter]::ToUInt16($buf, 0) -ne 0x5A4D) { throw "Not an MZ executable." }
-$pe = [BitConverter]::ToInt32($buf, 0x3C)
+$pe = [BitConverter]::ToInt32($buf, 60)
 if ($pe -lt 0 -or [BitConverter]::ToUInt32($buf, $pe) -ne 0x4550) { throw "Not a PE executable." }
 
-$fh = $pe + 4
-$sections = [BitConverter]::ToUInt16($buf, $fh + 2)
-$timestamp = [BitConverter]::ToUInt32($buf, $fh + 4)
-$optSize = [BitConverter]::ToUInt16($buf, $fh + 16)
-$opt = $fh + 20
-$isPe32Plus = [BitConverter]::ToUInt16($buf, $opt) -eq 0x20B
-if (!$isPe32Plus) { throw "Discord only fingerprints PE32+." }
+$opt = $pe + 24
+$magic = [BitConverter]::ToUInt16($buf, $opt)
+$isPe32Plus = $magic -eq 0x20B
+$optSize = if ($isPe32Plus) { 112 } else { 96 }
+$timestamp = [BitConverter]::ToUInt32($buf, $pe + 8)
+$sections = [BitConverter]::ToUInt16($buf, $pe + 6)
 $sizeOfImage = [BitConverter]::ToUInt32($buf, $opt + 56)
 
 $sectionTable = $opt + $optSize
@@ -209,9 +191,9 @@ for ($i = 1; $i -lt $out.Length; $i++) {
 
 
 def generate_fingerprint(user_id: str, path: str = "", pid: int = 0) -> str:
-    """run the powershell generator and return the base64 executable_fingerprint."""
+    """Run the PowerShell generator and return the base64 executable_fingerprint."""
     if os.name != "nt":
-        raise RuntimeError("fingerprint generation is windows-only")
+        raise RuntimeError("Fingerprint generation is Windows-only")
     script = Path(tempfile.gettempdir()) / f"disc_fp_{uuid.uuid4().hex}.ps1"
     script.write_text(_FINGERPRINT_PS1, encoding="utf-8")
     try:
@@ -226,15 +208,15 @@ def generate_fingerprint(user_id: str, path: str = "", pid: int = 0) -> str:
             pass
     if result.returncode != 0:
         lines = (result.stderr or result.stdout or "").strip().splitlines()
-        raise RuntimeError(lines[-1] if lines else "powershell failed")
+        raise RuntimeError(lines[-1] if lines else "PowerShell failed")
     out = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if not out:
-        raise RuntimeError("generator produced no output")
+        raise RuntimeError("No fingerprint returned")
     return out[-1]
 
 
 class Console:
-    """colored console output."""
+    """Simple colored console helper."""
 
     RED = "\x1b[91m"
     ORANGE = "\x1b[38;5;208m"
@@ -243,11 +225,11 @@ class Console:
     WHITE = "\x1b[97m"
     GREY = "\x1b[90m"
     RESET = "\x1b[0m"
-    RULE = "─" * 44
+    RULE = "─" * 48
 
     def __init__(self) -> None:
         try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # glyphs must encode even when stdout is piped
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
         if sys.platform == "win32":
@@ -255,12 +237,15 @@ class Console:
 
     @staticmethod
     def _enable_ansi() -> None:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except Exception:
+            pass
 
     def _stamp(self) -> str:
         return f"{self.GREY}{time.strftime('%H:%M:%S')}{self.RESET}"
@@ -293,13 +278,19 @@ class Console:
     def banner(self) -> None:
         self.clear()
         print()
-        print(f"  {self.ORANGE}spoofer{self.RESET} {self.GREY}·{self.RESET} {self.WHITE}discord badges{self.RESET}")
-        print(f"    {self.GREY}by revere group{self.RESET}")
+        print(f"  {self.ORANGE}Discord Badge Spoofer{self.RESET}")
+        print(f"  {self.GREY}modified by @its_me_kyro{self.RESET}")
+        print(f"  {self.GREY}https://x.com/its_me_kyro{self.RESET}")
+        print()
+        print(f"  {self.RED}I am against using this tool.{self.RESET}")
+        print(f"  {self.GREY}Badges are meaningless. This can get you banned.{self.RESET}")
         print()
 
 
 @dataclass
 class State:
+    """Persisted local state (token, cookie, fingerprint, stats)."""
+
     token: str = ""
     cookie: str = ""
     fingerprint: str = ""
@@ -308,8 +299,6 @@ class State:
     used_games: list[str] = None
     total_games_claimed: int = 0
     total_hours_claimed: float = 0.0
-    subscribed: bool = False
-    joined_discord: bool = False
 
     def __post_init__(self) -> None:
         if self.used_games is None:
@@ -319,8 +308,10 @@ class State:
     def load(cls) -> "State":
         if STATE_FILE.exists():
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            state = cls(**{k: data.get(k, v) for k, v in cls().__dict__.items() if k != "used_games"})
-            state.used_games = data.get("used_games", [])
+            known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore
+            filtered = {k: v for k, v in data.items() if k in known}
+            state = cls(**{k: filtered.get(k, getattr(cls(), k)) for k in known if k != "used_games"})
+            state.used_games = filtered.get("used_games", [])
             return state
         return cls()
 
@@ -363,8 +354,12 @@ def _local_props() -> dict:
 
 def build_super_props(launch_signature: str, heartbeat_session: str) -> str:
     try:
-        req = urllib.request.Request(PROPERTIES_URL, method="POST", data=b"{}",
-                                     headers={"content-type": "application/json", "user-agent": USER_AGENT})
+        req = urllib.request.Request(
+            PROPERTIES_URL,
+            method="POST",
+            data=b"{}",
+            headers={"content-type": "application/json", "user-agent": USER_AGENT},
+        )
         with urllib.request.urlopen(req, timeout=10) as response:
             props = json.loads(response.read().decode("utf-8"))["properties"]
     except Exception:
@@ -386,10 +381,10 @@ def _read_analytics_token(auth_token: str, super_props: str) -> str:
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"token rejected ({exc.code})") from exc
+        raise RuntimeError(f"Token rejected ({exc.code})") from exc
     token = data.get("analytics_token")
     if not token:
-        raise RuntimeError("no analytics_token in response")
+        raise RuntimeError("No analytics_token in response")
     return token
 
 
@@ -440,39 +435,31 @@ def _download_games() -> str:
     return raw
 
 
-def _parse_games(raw: str) -> list[Game]:
+def load_games() -> list[Game]:
+    if GAMES_FILE.exists():
+        raw = GAMES_FILE.read_text(encoding="utf-8")
+    else:
+        raw = _download_games()
     data = json.loads(raw)
     games: list[Game] = []
-    seen: set[str] = set()
     for entry in data:
         gid = str(entry.get("id", ""))
-        if not gid.isdigit() or gid in seen:
+        if not gid:
             continue
         if not any(e.get("os") == "win32" and e.get("name") for e in entry.get("executables", [])):
             continue
-        seen.add(gid)
         games.append(Game(gid, entry.get("name", "Unknown"), _win_exe(entry)))
     return games
 
 
-def load_games() -> list[Game]:
-    raw = ""
-    if GAMES_FILE.exists():
-        raw = GAMES_FILE.read_text(encoding="utf-8").strip()
-    if raw:
-        try:
-            games = _parse_games(raw)
-            if games:
-                return games
-        except (json.JSONDecodeError, ValueError):
-            pass
-    try:
-        return _parse_games(_download_games())
-    except Exception:
-        return []
+def _chunked(items: Sequence[Game], size: int) -> Iterator[Sequence[Game]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 class ScienceClient:
+    """Builds and posts launch_game / running_game_heartbeat events."""
+
     def __init__(self, state: State, session: Session) -> None:
         self.state = state
         self.session = session
@@ -527,8 +514,16 @@ class ScienceClient:
             del props["executable_fingerprint"]
         return {"type": "launch_game", "properties": props}
 
-    def build_heartbeat(self, game: Game, duration_ms: int, session_id: str,
-                        initial: bool, final: bool, ts: int | None = None) -> dict:
+    def build_heartbeat(
+        self,
+        game: Game,
+        duration_ms: int,
+        session_id: str,
+        *,
+        initial: bool,
+        final: bool,
+        ts: int | None = None,
+    ) -> dict:
         ts = int(time.time() * 1000) if ts is None else ts
         return {
             "type": "running_game_heartbeat",
@@ -582,6 +577,12 @@ class ScienceClient:
             "x-discord-timezone": "Europe/Oslo",
             "x-super-properties": self.session.super_props,
         }
+        if DEBUG:
+            print("\n" + "=" * 72)
+            print(f"POST {SCIENCE_URL} ({len(payload['events'])} events)")
+            print("headers:", json.dumps(headers, indent=2))
+            print("body:", json.dumps(payload, indent=2))
+            print("=" * 72)
         request = urllib.request.Request(SCIENCE_URL, data=body, method="POST", headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
@@ -590,11 +591,6 @@ class ScienceClient:
             return exc.code
         except Exception:
             return 0
-
-
-def _chunked(items: Sequence[Game], size: int) -> Iterator[Sequence[Game]]:
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
 
 
 class Spoofer:
@@ -606,17 +602,17 @@ class Spoofer:
         total = len(games)
         sent_ok = 0
         for request_no, chunk in enumerate(_chunked(games, BATCH_SIZE), start=1):
-            events = []
-            for game in chunk:
-                events.extend(build_events(game))
+            events: list[dict] = []
+            for g in chunk:
+                events.extend(build_events(g))
             status = self.client.post(events)
             if status == 204:
                 sent_ok += len(chunk)
                 self.console.sent(f"batch {request_no}", f"{sent_ok}/{total} games")
             elif status in (401, 403):
                 self.console.err(f"batch {request_no}",
-                                 f"[{status}] auth rejected · refresh (option 3) with a fresh cookie")
-                return sent_ok
+                                 f"[{status}] auth rejected · refresh auth with a fresh cookie")
+                break
             else:
                 self.console.warn(f"batch {request_no}", f"[{status}]")
             time.sleep(BATCH_DELAY)
@@ -631,103 +627,69 @@ class App:
         self.client: ScienceClient | None = None
         self.games: list[Game] = []
 
-    def _flush_stdin(self) -> None:
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-                while msvcrt.kbhit():
-                    msvcrt.getwch()
-            else:
-                import termios
-                termios.tcflush(sys.stdin, termios.TCIFLUSH)
-        except Exception:
-            pass
-
-    def _gate_step(self, step: int, total: int, action: str, label: str, url: str, done: str) -> None:
-        C = self.console
-        C.rule()
-        C.info(f"{C.ORANGE}step {step} of {total}{C.WHITE} · {action} {C.ORANGE}{label}{C.WHITE} to continue")
-        C.rule()
-        C.info("opening it in your browser...")
-        webbrowser.open(url)
-        for left in range(GATE_WAIT, 0, -1):
-            print(f"\r  {C.GREY}continue available in {left}s...{C.RESET}  ", end="", flush=True)
-            time.sleep(1)
-        print("\r" + " " * 40 + "\r", end="")
-        self._flush_stdin()
-        input(f"  {C.ORANGE}›{C.RESET} press enter once you've {done} ")
-        print()
-
-    def _gate(self) -> None:
-        steps = [
-            ("subscribed", "subscribe to", "youtube.com/@solasity", SUBSCRIBE_URL, "subscribed"),
-            ("joined_discord", "join", DISCORD_INVITE_LABEL, DISCORD_INVITE_URL, "joined"),
-        ]
-        total = len(steps)
-        for i, (flag, action, label, url, done) in enumerate(steps, 1):
-            if getattr(self.state, flag):
-                continue
-            self._gate_step(i, total, action, label, url, done)
-            setattr(self.state, flag, True)
-            self.state.save()
-        self.console.ok("setup", f"all {total} steps done · thanks!")
-        time.sleep(0.5)
-
     def start(self) -> None:
         self.console.banner()
-        time.sleep(0.8)
+        time.sleep(0.4)
+
+        print()
+        self.console.rule()
+        self.console.warn("WARNING", "This tool violates Discord's Terms of Service")
+        self.console.info("https://discord.com/terms")
+        print()
+        self.console.info("I (@its_me_kyro) have NEVER used this tool and never will.")
+        self.console.info("I am against people using it.")
+        self.console.info("Profile badges mean nothing. Even big creators don't care about them.")
+        self.console.info("Running this is one of the easiest ways to get your account suspended.")
+        self.console.info("If your goal is to get banned, then continue.")
+        self.console.rule()
+        print()
+        answer = input(f"  {self.console.ORANGE}Do you still want to continue? (yes/no):{self.console.RESET} ").strip().lower()
+        if answer not in ("yes", "y"):
+            self.console.info("Good choice. Aborted.")
+            return
+        print()
+        self.console.warn("risk", "You were warned. Any ban is on you.")
         print()
 
-        if not (self.state.subscribed and self.state.joined_discord):
-            self._gate()
-
-        C = self.console
+        # Token
         if not self.state.has_token:
             self._prompt_token()
+            if not self.state.has_token:
+                self.console.err("token", "required")
+                return
         else:
-            C.ok("auth", "token loaded")
-            time.sleep(0.5)
-        if not self.state.has_token:
-            C.err("token", "required to run")
-            return
+            self.console.ok("token", "loaded from local state")
 
+        # Cookie
         if not self.state.has_cookie:
-            self.console.banner()
             self._prompt_cookie()
+            if not self.state.has_cookie:
+                self.console.err("cookie", "required · use option 3 later to set one")
+                return
         else:
-            C.ok("auth", "cookie loaded")
-            time.sleep(0.5)
-        if not self.state.has_cookie:
-            C.err("cookie", "required to run")
-            return
+            self.console.ok("cookie", "loaded from local state")
 
-        self.console.banner()
-        print()
-        C.info("loading games...")
-        time.sleep(0.4)
-        self.games = load_games()
-        if not self.games:
-            C.err("games", "couldn't load the game list")
+        # Games
+        try:
+            self.games = load_games()
+        except Exception as exc:
+            self.console.err("games", str(exc))
             return
-        C.ok("games", f"{C.ORANGE}{len(self.games)}{C.WHITE} loaded")
-        time.sleep(0.5)
+        self.console.ok("games", f"{len(self.games)} loaded")
 
         if not self.state.fingerprint:
-            print()
-            C.warn("fingerprint", "not set · script may not credit the badges")
-            time.sleep(0.5)
+            self.console.warn("fingerprint", "not set (optional · helps games-played count)")
 
-        print()
-        C.info("validating auth...")
+        # Auth
+        self.console.info("validating auth...")
         self._new_session()
         try:
             ensure_token(self.state, self.session.super_props)
         except Exception as exc:
-            C.err("token", str(exc))
+            self.console.err("token", str(exc))
             return
-        C.ok("auth", "ready")
-        time.sleep(0.5)
-
+        self.console.ok("auth", "ready")
+        time.sleep(0.4)
         print()
         self.menu()
 
@@ -736,44 +698,48 @@ class App:
         self.client = ScienceClient(self.state, self.session)
 
     def _prompt_token(self) -> None:
-        self.console.info("paste your discord account token")
+        self.console.info("Paste your Discord account token")
+        self.console.info("How to get it: DevTools → Application → Local Storage → discord.com → filter 'token'")
+        self.console.info("Copy the value of the key named exactly 'token' (not 'tokens')")
         entered = input(f"  {self.console.GREY}token:{self.console.RESET} ").strip()
         if entered:
             self.state.token = entered
             self.state.save()
-            self.console.ok("token", "saved")
-            time.sleep(1.5)
+            self.console.ok("token", "saved locally (only on your machine)")
 
     def _prompt_cookie(self) -> None:
-        self.console.info("paste your cf_clearance cookie header")
+        self.console.info("Paste the full cookie header (must include cf_clearance)")
         entered = input(f"  {self.console.GREY}cookie:{self.console.RESET} ").strip()
         if entered:
             self.state.cookie = entered
             self.state.save()
-            self.console.ok("cookie", "saved")
-            time.sleep(1.5)
+            self.console.ok("cookie", "saved locally")
 
     def _refresh(self) -> None:
-        self.console.info("update cookie? [y/n]")
-        choice = input(f"  {self.console.GREY}›{self.console.RESET} ").strip().lower()
+        C = self.console
+        C.info("Update cookie? (recommended if batches stop working) [y/n]")
+        choice = input(f"  {C.GREY}›{C.RESET} ").strip().lower()
         if choice in ("y", "yes"):
-            self.console.info("paste a fresh cookie header")
-            entered = input(f"  {self.console.GREY}cookie:{self.console.RESET} ").strip()
+            C.info("Paste a fresh full cookie header (must include cf_clearance)")
+            entered = input(f"  {C.GREY}cookie:{C.RESET} ").strip()
             if entered:
                 self.state.cookie = entered
-                self.console.ok("cookie", "updated")
+                C.ok("cookie", "updated")
+            else:
+                C.info("cookie unchanged")
 
-        self.console.info("refreshing analytics token...")
+        C.info("Refreshing analytics token...")
         try:
             self.state.fetched_at = 0
             ensure_token(self.state, self.session.super_props)
         except Exception as exc:
-            self.console.err("auth", str(exc))
+            C.err("auth", str(exc))
+            C.info("Try pasting a fresh cookie and token if this keeps failing")
             return
         self._new_session()
         self.state.save()
-        self.console.ok("auth", "refreshed")
-        time.sleep(1.5)
+        C.ok("auth", "refreshed · ready for new batches")
+        time.sleep(1.0)
 
     def _require_ready(self) -> bool:
         if not self.state.has_cookie:
@@ -793,21 +759,24 @@ class App:
             return
         C = self.console
         print()
-        C.info(f"loaded {C.GREEN}{len(self.games)}{C.WHITE} games available")
+        C.info(f"Loaded {C.GREEN}{len(self.games)}{C.WHITE} games")
 
-        raw_count = input(f"  {C.GREY}how many games? [all]:{C.RESET} ").strip()
+        raw_count = input(f"  {C.GREY}How many games? [all]:{C.RESET} ").strip()
         try:
             count = int(raw_count) if raw_count else len(self.games)
         except ValueError:
             C.err("input", "invalid count")
             return
-        count = min(count, len(self.games))
+        count = max(1, min(count, len(self.games)))
 
-        raw_hours = input(f"  {C.GREY}hours per game? [1]:{C.RESET} ").strip()
+        raw_hours = input(f"  {C.GREY}Hours per game? [1]:{C.RESET} ").strip()
         try:
             hours = float(raw_hours) if raw_hours else 1.0
         except ValueError:
             C.err("input", "invalid hours")
+            return
+        if hours <= 0:
+            C.err("input", "hours must be positive")
             return
 
         selected = self._select_games(count)
@@ -819,7 +788,7 @@ class App:
         total_hours = len(selected) * hours
         print()
         C.info(
-            f"claiming {C.ORANGE}{hours:g}h{C.WHITE} on "
+            f"Claiming {C.ORANGE}{hours:g}h{C.WHITE} on "
             f"{C.ORANGE}{len(selected)}{C.WHITE} games "
             f"{C.GREY}·{C.WHITE} {total_hours:,.0f}h total"
         )
@@ -833,10 +802,85 @@ class App:
         self.state.total_games_claimed += ok
         self.state.total_hours_claimed += ok * hours
         self.state.save()
-
         C.rule()
         input(f"  {C.ORANGE}›{C.RESET} press enter to continue")
+
+    def add_hours_to_specific(self) -> None:
+        if not self._require_ready():
+            return
+        C = self.console
+        print()
+        C.info("Search games by name (partial match is fine)")
+        query = input(f"  {C.GREY}search:{C.RESET} ").strip().lower()
+        if not query:
+            C.info("Cancelled")
+            return
+
+        matches = [g for g in self.games if query in g.name.lower()]
+        if not matches:
+            C.err("search", "no games matched")
+            return
+
+        shown = matches[:30]
+        print()
+        C.info(f"Found {len(matches)} match(es) · showing first {len(shown)}")
         C.rule()
+        for i, g in enumerate(shown, 1):
+            print(f"  {C.ORANGE}{i:2}{C.RESET}  {g.name}")
+        if len(matches) > 30:
+            C.info(f"... and {len(matches) - 30} more (refine your search)")
+        C.rule()
+
+        raw = input(f"  {C.GREY}Select numbers (e.g. 1 3 5) or 'all':{C.RESET} ").strip().lower()
+        if not raw:
+            C.info("Cancelled")
+            return
+
+        if raw == "all":
+            selected = shown
+        else:
+            try:
+                idxs = [int(x) for x in raw.replace(",", " ").split()]
+                selected = [shown[i - 1] for i in idxs if 1 <= i <= len(shown)]
+            except ValueError:
+                C.err("input", "invalid selection")
+                return
+
+        if not selected:
+            C.err("select", "no valid games chosen")
+            return
+
+        raw_hours = input(f"  {C.GREY}Hours to add per game? [1]:{C.RESET} ").strip()
+        try:
+            hours = float(raw_hours) if raw_hours else 1.0
+        except ValueError:
+            C.err("input", "invalid hours")
+            return
+        if hours <= 0:
+            C.err("input", "hours must be positive")
+            return
+
+        duration_ms = int(hours * 3600 * 1000)
+        print()
+        C.info(
+            f"Adding {C.ORANGE}{hours:g}h{C.WHITE} to "
+            f"{C.ORANGE}{len(selected)}{C.WHITE} selected game(s)"
+        )
+        for g in selected:
+            C.info(f"  → {g.name}")
+        C.rule()
+
+        ok = Spoofer(self.client, self.console).run(
+            selected,
+            lambda g: self.client.build_session(g, duration_ms),
+        )
+        print()
+        C.ok("complete", f"{ok}/{len(selected)} games · {ok * hours:,.0f}h added")
+        self.state.total_games_claimed += ok
+        self.state.total_hours_claimed += ok * hours
+        self.state.save()
+        C.rule()
+        input(f"  {C.ORANGE}›{C.RESET} press enter to continue")
 
     def _select_games(self, count: int) -> list[Game]:
         available_ids = {g.id for g in self.games}
@@ -860,21 +904,28 @@ class App:
         C = self.console
         uid = _user_id_from_token(self.state.token)
         if not uid:
-            C.err("fingerprint", "no valid token · set one first")
+            C.err("fingerprint", "could not parse user id from token · set a valid token first")
             time.sleep(1.5)
             return
         if os.name != "nt":
-            C.err("fingerprint", "windows-only feature")
+            C.err("fingerprint", "Windows-only feature")
             time.sleep(1.5)
             return
-        C.info("generate an executable_fingerprint tied to this account + machine")
+        C.info("Generate an executable_fingerprint tied to this account + machine")
+        C.info(f"Account: {C.ORANGE}{uid}{C.RESET}")
+        C.info("Provide a game .exe path or a running process PID")
         entered = input(f"  {C.GREY}exe path or pid:{C.RESET} ").strip().strip('"')
         if not entered:
-            C.info("cancelled")
+            C.info("Cancelled")
             time.sleep(1)
             return
         pid = int(entered) if entered.isdigit() else 0
         path = "" if pid else entered
+        if path and not Path(path).exists():
+            C.err("fingerprint", f"file not found: {path}")
+            time.sleep(1.5)
+            return
+        C.info("Generating...")
         try:
             fp = generate_fingerprint(uid, path=path, pid=pid)
         except Exception as exc:
@@ -892,26 +943,33 @@ class App:
             C.clear()
             C.banner()
             print()
-            C.info(f"loaded {C.ORANGE}{len(self.games)}{C.WHITE} games")
-            C.info(f"claimed {C.ORANGE}{self.state.total_games_claimed}{C.WHITE} games · {C.ORANGE}{self.state.total_hours_claimed:,.0f}h{C.WHITE} total")
+            C.info(f"Loaded {C.ORANGE}{len(self.games)}{C.WHITE} games")
+            C.info(
+                f"Session stats: {C.ORANGE}{self.state.total_games_claimed}{C.WHITE} games · "
+                f"{C.ORANGE}{self.state.total_hours_claimed:,.0f}h{C.WHITE} claimed"
+            )
             C.rule()
-            C.info(f"{C.ORANGE}1{C.RESET} · claim games")
-            C.info(f"{C.ORANGE}2{C.RESET} · refresh auth")
-            C.info(f"{C.ORANGE}3{C.RESET} · set fingerprint")
-            C.info(f"{C.ORANGE}4{C.RESET} · exit")
+            C.info(f"{C.ORANGE}1{C.RESET}  Claim playtime (batch / random rotation)")
+            C.info(f"{C.ORANGE}2{C.RESET}  Add hours to specific games (search by name)")
+            C.info(f"{C.ORANGE}3{C.RESET}  Refresh auth / update cookie")
+            C.info(f"{C.ORANGE}4{C.RESET}  Set fingerprint (optional, Windows)")
+            C.info(f"{C.ORANGE}5{C.RESET}  Exit")
             C.rule()
             choice = input(f"  {C.ORANGE}›{C.RESET} ").strip()
             print()
             if choice == "1":
                 self.claim_games()
             elif choice == "2":
-                self._refresh()
+                self.add_hours_to_specific()
             elif choice == "3":
+                self._refresh()
+            elif choice == "4":
                 self.set_fingerprint()
-            elif choice in ("4", ""):
+            elif choice in ("5", "q", "quit", "exit", ""):
                 break
             else:
                 C.warn("input", "invalid option")
+                time.sleep(0.8)
 
 
 def main() -> None:
